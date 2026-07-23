@@ -1,7 +1,11 @@
-using Microsoft.Win32;
-using System.Windows;
 using ConquerRsaTool.Core.Crypto;
 using ConquerRsaTool.Core.Patching;
+using Microsoft.Win32;
+using System.Diagnostics;
+using System.IO;
+using System.Security.Cryptography;
+using System.Windows;
+using System.Windows.Automation;
 
 namespace ConquerRsaTool.Wpf;
 
@@ -10,11 +14,50 @@ public partial class MainWindow : Window
     private readonly RsaKeyService _keys = new();
     private readonly ConquerDatService _dat = new();
     private readonly ConquerBinaryService _binary = new();
+    private readonly string _keyDirectory;
+    private readonly string _publicKeyPath;
+    private readonly string _privateKeyPath;
+    private readonly string _originalClientPublicKeyPath;
+    private string? _lastOutputPath;
 
     public MainWindow()
     {
         InitializeComponent();
-        Log("Aplicación iniciada. Trabaja siempre sobre copias de seguridad.");
+
+        _keyDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "ConquerServerPatcher",
+            "keys");
+        _publicKeyPath = Path.Combine(_keyDirectory, "public_key.pem");
+        _privateKeyPath = Path.Combine(_keyDirectory, "private_key.pem");
+        _originalClientPublicKeyPath = Path.Combine(
+            _keyDirectory,
+            "original_client_public_key.pem");
+
+        RefreshKeyStatus();
+        Log("Application ready. The original client will never be overwritten.");
+    }
+
+    private void MinimizeWindow_Click(object sender, RoutedEventArgs e) =>
+        WindowState = WindowState.Minimized;
+
+    private void MaximizeWindow_Click(object sender, RoutedEventArgs e) =>
+        WindowState = WindowState == WindowState.Maximized
+            ? WindowState.Normal
+            : WindowState.Maximized;
+
+    private void CloseWindow_Click(object sender, RoutedEventArgs e) => Close();
+
+    private void Window_StateChanged(object? sender, EventArgs e)
+    {
+        var maximized = WindowState == WindowState.Maximized;
+        MaximizeWindowButton.Content = maximized ? "\uE923" : "\uE922";
+        AutomationProperties.SetName(
+            MaximizeWindowButton,
+            maximized ? "Restore" : "Maximize");
+        RootBorder.CornerRadius = maximized
+            ? new CornerRadius(0)
+            : new CornerRadius(12);
     }
 
     private async Task RunAsync(string operation, Action action)
@@ -24,57 +67,396 @@ public partial class MainWindow : Window
             IsEnabled = false;
             Log($"{operation}...");
             await Task.Run(action);
-            Log($"{operation}: completado.");
+            Log($"{operation}: completed.");
         }
         catch (Exception ex)
         {
             Log($"ERROR: {ex.Message}");
-            MessageBox.Show(this, ex.Message, "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            var isAlreadyPatched = ex is ClientAlreadyPatchedException;
+            MessageBox.Show(
+                this,
+                ex.Message,
+                isAlreadyPatched ? "Client already patched" : "Operation failed",
+                MessageBoxButton.OK,
+                isAlreadyPatched ? MessageBoxImage.Information : MessageBoxImage.Error);
         }
-        finally { IsEnabled = true; }
+        finally
+        {
+            IsEnabled = true;
+            RefreshKeyStatus();
+        }
     }
+
+    private async void SelectClient_Click(object sender, RoutedEventArgs e)
+    {
+        var exePath = Open(
+            "Conquer client|Conquer.exe;*.exe|Executable files|*.exe");
+        if (exePath is null)
+            return;
+
+        ExePath.Text = exePath;
+        OutputFileName.Text =
+            $"{Path.GetFileNameWithoutExtension(exePath)}Patched.exe";
+        ResultPanel.Visibility = Visibility.Collapsed;
+        ClientStatusText.Text = "Checking the client...";
+        ClientStatusText.Foreground =
+            (System.Windows.Media.Brush)FindResource("MutedTextBrush");
+        ApplyPatchButton.IsEnabled = false;
+
+        await RunAsync("Checking client", () =>
+        {
+            if (File.Exists(_publicKeyPath) &&
+                _binary.IsPatchedWithPublicKey(exePath, _publicKeyPath))
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    ClientStatusText.Text =
+                        "This executable is already patched with the current permanent key.";
+                    ClientStatusText.Foreground =
+                        (System.Windows.Media.Brush)FindResource("SuccessBrush");
+                });
+                throw new ClientAlreadyPatchedException(
+                    "The selected executable is already patched with the current key. " +
+                    "It does not need to be patched again.");
+            }
+
+            var analysis = _binary.Analyze(exePath);
+            if (!analysis.Supported)
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    ClientStatusText.Text =
+                        "This does not appear to be a compatible original client, " +
+                        "or it was patched with a different key.";
+                    ClientStatusText.Foreground = System.Windows.Media.Brushes.DarkRed;
+                });
+                throw new InvalidDataException(analysis.Message);
+            }
+
+            Dispatcher.Invoke(() =>
+            {
+                ClientStatusText.Text =
+                    "Compatible original client. Review the name and apply the patch.";
+                ClientStatusText.Foreground =
+                    (System.Windows.Media.Brush)FindResource("SuccessBrush");
+                ApplyPatchButton.IsEnabled = true;
+            });
+        });
+    }
+
+    private async void ApplyPatch_Click(object sender, RoutedEventArgs e)
+    {
+        var exePath = RequireSelectedClient();
+        if (exePath is null)
+            return;
+
+        ResultPanel.Visibility = Visibility.Collapsed;
+        ClientStatusText.Text = "Applying patch...";
+        var bypassPlayExe = BypassPlayExe.IsChecked == true;
+        var requestedOutputName = OutputFileName.Text.Trim();
+
+        await RunAsync("Preparing client", () =>
+        {
+            var created = EnsureManagedKeyPair();
+            Log(created
+                ? "A permanent server key pair was generated."
+                : "Using the existing permanent server key.");
+
+            if (_binary.IsPatchedWithPublicKey(exePath, _publicKeyPath))
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    ClientStatusText.Text =
+                        "This executable is already patched with the current permanent key.";
+                    ClientStatusText.Foreground =
+                        (System.Windows.Media.Brush)FindResource("SuccessBrush");
+                });
+                throw new ClientAlreadyPatchedException(
+                    "The selected executable is already patched with the current key. " +
+                    "No changes were made.");
+            }
+
+            var analysis = _binary.Analyze(exePath);
+            if (!analysis.Supported)
+                throw new InvalidDataException(analysis.Message);
+
+            _binary.ExtractPublicKey(exePath, _originalClientPublicKeyPath);
+            Log("The client's original public key was saved for DAT decryption.");
+
+            var outputFileName = ResolveOutputFileName(exePath, requestedOutputName);
+            var outputPath = Path.Combine(
+                Path.GetDirectoryName(exePath)!,
+                outputFileName);
+
+            var result = _binary.Patch(
+                exePath,
+                _publicKeyPath,
+                outputPath,
+                bypassPlayExe);
+
+            Dispatcher.Invoke(() =>
+            {
+                _lastOutputPath = result.OutputPath;
+                ClientStatusText.Text =
+                    "Original client detected and patched successfully.";
+                ClientStatusText.Foreground =
+                    (System.Windows.Media.Brush)FindResource("SuccessBrush");
+                ResultText.Text =
+                    $"Saved to {result.OutputPath}. {result.PlayExeBypassMessage}";
+                ResultPanel.Visibility = Visibility.Visible;
+            });
+        });
+    }
+
+    private async void Analyze_Click(object sender, RoutedEventArgs e)
+    {
+        var path = RequireSelectedClient();
+        if (path is null)
+            return;
+
+        await RunAsync("Analyzing client", () =>
+        {
+            if (File.Exists(_publicKeyPath) &&
+                _binary.IsPatchedWithPublicKey(path, _publicKeyPath))
+            {
+                Log("The client is already patched with the current permanent key.");
+                Dispatcher.Invoke(() =>
+                {
+                    ClientStatusText.Text =
+                        "This executable is already patched with the current permanent key.";
+                    ClientStatusText.Foreground =
+                        (System.Windows.Media.Brush)FindResource("SuccessBrush");
+                });
+                return;
+            }
+
+            var result = _binary.Analyze(path);
+            Log($"Compatible: {(result.Supported ? "yes" : "no")}. {result.Message}");
+            if (!result.Supported)
+                throw new InvalidDataException(result.Message);
+        });
+    }
+
+    private async void ExtractKey_Click(object sender, RoutedEventArgs e)
+    {
+        var path = RequireSelectedClient();
+        if (path is null)
+            return;
+
+        var output = Save("PEM key|*.pem", "original_public_key.pem");
+        if (output is null)
+            return;
+
+        await RunAsync(
+            "Extracting original key",
+            () => _binary.ExtractPublicKey(path, output));
+    }
+
+    private async void DecryptDat_Click(object sender, RoutedEventArgs e)
+    {
+        var input = Open("DAT files|*.dat|All files|*.*");
+        if (input is null)
+            return;
+
+        var output = DefaultOutput(input, "_decrypted");
+        await RunAsync("Decrypting DAT", () =>
+        {
+            if (!File.Exists(_originalClientPublicKeyPath))
+            {
+                throw new InvalidDataException(
+                    "The client's original key has not been extracted. " +
+                    "Choose and patch the original Conquer.exe first.");
+            }
+
+            _dat.Decrypt(input, _originalClientPublicKeyPath, output);
+            Log($"File saved to {output}");
+        });
+    }
+
+    private async void EncryptDat_Click(object sender, RoutedEventArgs e)
+    {
+        var input = Open("DAT files|*.dat|All files|*.*");
+        if (input is null)
+            return;
+
+        var output = DefaultOutput(input, "_encrypted");
+        await RunAsync("Encrypting DAT", () =>
+        {
+            EnsureManagedKeyPair();
+            _dat.Encrypt(input, _privateKeyPath, output);
+            Log($"File saved to {output}");
+        });
+    }
+
+    private bool EnsureManagedKeyPair()
+    {
+        var publicExists = File.Exists(_publicKeyPath);
+        var privateExists = File.Exists(_privateKeyPath);
+
+        if (!publicExists && !privateExists)
+        {
+            _keys.GenerateKeyPair(_publicKeyPath, _privateKeyPath);
+            return true;
+        }
+
+        if (!publicExists || !privateExists)
+        {
+            throw new InvalidDataException(
+                $"The key store is incomplete. Check this folder: {_keyDirectory}");
+        }
+
+        var publicKey = _keys.LoadPublic(_publicKeyPath);
+        var privateKey = _keys.LoadPrivate(_privateKeyPath);
+        if (publicKey.Modulus is null ||
+            privateKey.Modulus is null ||
+            !CryptographicOperations.FixedTimeEquals(
+                publicKey.Modulus,
+                privateKey.Modulus))
+        {
+            throw new InvalidDataException(
+                $"The public and private keys are not a valid pair. Check: {_keyDirectory}");
+        }
+
+        return false;
+    }
+
+    private void RefreshKeyStatus()
+    {
+        if (File.Exists(_publicKeyPath) && File.Exists(_privateKeyPath))
+        {
+            KeyStatusText.Text =
+                "Permanent key available. It will be reused automatically.";
+            KeyStatusText.Foreground =
+                (System.Windows.Media.Brush)FindResource("SuccessBrush");
+        }
+        else if (File.Exists(_publicKeyPath) || File.Exists(_privateKeyPath))
+        {
+            KeyStatusText.Text =
+                "The key store is incomplete. Open the folder to review it.";
+            KeyStatusText.Foreground = System.Windows.Media.Brushes.DarkRed;
+        }
+        else
+        {
+            KeyStatusText.Text =
+                "A permanent key will be generated when the first client is patched.";
+            KeyStatusText.Foreground =
+                (System.Windows.Media.Brush)FindResource("MutedTextBrush");
+        }
+    }
+
+    private string? RequireSelectedClient()
+    {
+        if (!string.IsNullOrWhiteSpace(ExePath.Text) && File.Exists(ExePath.Text))
+            return Path.GetFullPath(ExePath.Text);
+
+        MessageBox.Show(
+            this,
+            "Choose a client first.",
+            "No client selected",
+            MessageBoxButton.OK,
+            MessageBoxImage.Information);
+        return null;
+    }
+
+    private void OpenKeysFolder_Click(object sender, RoutedEventArgs e)
+    {
+        Directory.CreateDirectory(_keyDirectory);
+        OpenFolder(_keyDirectory);
+    }
+
+    private void OpenOutputFolder_Click(object sender, RoutedEventArgs e)
+    {
+        if (_lastOutputPath is not null)
+            OpenFolder(Path.GetDirectoryName(_lastOutputPath)!);
+    }
+
+    private static void OpenFolder(string path) =>
+        Process.Start(new ProcessStartInfo("explorer.exe", $"\"{path}\"")
+        {
+            UseShellExecute = true
+        });
 
     private void Log(string message)
     {
-        Dispatcher.Invoke(() => { LogBox.AppendText($"[{DateTime.Now:HH:mm:ss}] {message}{Environment.NewLine}"); LogBox.ScrollToEnd(); });
+        Dispatcher.Invoke(() =>
+        {
+            LogBox.AppendText(
+                $"[{DateTime.Now:HH:mm:ss}] {message}{Environment.NewLine}");
+            LogBox.ScrollToEnd();
+        });
     }
 
     private static string? Open(string filter)
     {
-        var dialog = new OpenFileDialog { Filter = filter, CheckFileExists = true };
+        var dialog = new OpenFileDialog
+        {
+            Filter = filter,
+            CheckFileExists = true
+        };
         return dialog.ShowDialog() == true ? dialog.FileName : null;
     }
 
     private static string? Save(string filter, string fileName)
     {
-        var dialog = new SaveFileDialog { Filter = filter, FileName = fileName, AddExtension = true };
+        var dialog = new SaveFileDialog
+        {
+            Filter = filter,
+            FileName = fileName,
+            AddExtension = true
+        };
         return dialog.ShowDialog() == true ? dialog.FileName : null;
     }
 
-    private void BrowseExe_Click(object s, RoutedEventArgs e) { var p=Open("Ejecutable Conquer|*.exe|Todos|*.*"); if(p!=null){ExePath.Text=p; PatchedExeOutput.Text=Path.Combine(Path.GetDirectoryName(p)!,"Conquer_modified.exe");} }
-    private void BrowsePatchPublicKey_Click(object s, RoutedEventArgs e) => Set(PatchPublicKeyPath, Open("Clave PEM|*.pem|Todos|*.*"));
-    private void BrowsePatchedOutput_Click(object s, RoutedEventArgs e) => Set(PatchedExeOutput, Save("Ejecutable|*.exe", "Conquer_modified.exe"));
-    private void BrowsePublicOutput_Click(object s, RoutedEventArgs e) => Set(PublicKeyOutput, Save("Clave PEM|*.pem", "public_key.pem"));
-    private void BrowsePrivateOutput_Click(object s, RoutedEventArgs e) => Set(PrivateKeyOutput, Save("Clave PEM|*.pem", "private_key.pem"));
-    private void BrowseDecryptInput_Click(object s, RoutedEventArgs e) { var p=Open("Archivos DAT|*.dat|Todos|*.*"); if(p!=null){DecryptInput.Text=p; DecryptOutput.Text=DefaultOutput(p,"_decrypted");} }
-    private void BrowseDecryptKey_Click(object s, RoutedEventArgs e) => Set(DecryptPublicKey, Open("Clave PEM|*.pem|Todos|*.*"));
-    private void BrowseDecryptOutput_Click(object s, RoutedEventArgs e) => Set(DecryptOutput, Save("Archivos DAT|*.dat|Todos|*.*", "decrypted.dat"));
-    private void BrowseEncryptInput_Click(object s, RoutedEventArgs e) { var p=Open("Archivos DAT|*.dat|Todos|*.*"); if(p!=null){EncryptInput.Text=p; EncryptOutput.Text=DefaultOutput(p,"_encrypted");} }
-    private void BrowseEncryptKey_Click(object s, RoutedEventArgs e) => Set(EncryptPrivateKey, Open("Clave PEM|*.pem|Todos|*.*"));
-    private void BrowseEncryptOutput_Click(object s, RoutedEventArgs e) => Set(EncryptOutput, Save("Archivos DAT|*.dat|Todos|*.*", "encrypted.dat"));
+    private static string DefaultOutput(string path, string suffix) =>
+        Path.Combine(
+            Path.GetDirectoryName(path)!,
+            Path.GetFileNameWithoutExtension(path) +
+            suffix +
+            Path.GetExtension(path));
 
-    private async void GenerateKeys_Click(object s, RoutedEventArgs e) => await RunAsync("Generando claves", () => _keys.GenerateKeyPair(Required(PublicKeyOutput.Text,"destino público"), Required(PrivateKeyOutput.Text,"destino privado")));
-    private async void Analyze_Click(object s, RoutedEventArgs e) => await RunAsync("Analizando cliente", () => { var r=_binary.Analyze(Required(ExePath.Text,"Conquer.exe")); Log($"Compatible: {(r.Supported?"sí":"no")}. {r.Message} Formato: {(r.IsContiguous?"matriz contigua":"instrucciones Windows")}"); if(!r.Supported) throw new InvalidDataException(r.Message); });
-    private async void ExtractKey_Click(object s, RoutedEventArgs e)
+    private static string ResolveOutputFileName(
+        string sourcePath,
+        string requestedName)
     {
-        var output=Save("Clave PEM|*.pem","extracted_public_key.pem"); if(output is null)return;
-        await RunAsync("Extrayendo clave pública", () => _binary.ExtractPublicKey(Required(ExePath.Text,"Conquer.exe"),output));
-    }
-    private async void PatchClient_Click(object s, RoutedEventArgs e) => await RunAsync("Parcheando cliente", () => { var r=_binary.Patch(Required(ExePath.Text,"Conquer.exe"),Required(PatchPublicKeyPath.Text,"clave pública"),Required(PatchedExeOutput.Text,"destino"),BypassPlayExe.IsChecked==true); Log(r.PlayExeBypassMessage); });
-    private async void Decrypt_Click(object s, RoutedEventArgs e) => await RunAsync("Descifrando archivo", () => _dat.Decrypt(Required(DecryptInput.Text,"archivo cifrado"),Required(DecryptPublicKey.Text,"clave pública"),Required(DecryptOutput.Text,"destino")));
-    private async void Encrypt_Click(object s, RoutedEventArgs e) => await RunAsync("Cifrando archivo", () => _dat.Encrypt(Required(EncryptInput.Text,"archivo plano"),Required(EncryptPrivateKey.Text,"clave privada"),Required(EncryptOutput.Text,"destino")));
+        var outputName = string.IsNullOrWhiteSpace(requestedName)
+            ? $"{Path.GetFileNameWithoutExtension(sourcePath)}Patched.exe"
+            : requestedName;
 
-    private static void Set(System.Windows.Controls.TextBox box, string? value) { if(value!=null)box.Text=value; }
-    private static string Required(string value, string name) => string.IsNullOrWhiteSpace(value) ? throw new InvalidOperationException($"Falta seleccionar: {name}.") : Path.GetFullPath(value);
-    private static string DefaultOutput(string path,string suffix) => Path.Combine(Path.GetDirectoryName(path)!,Path.GetFileNameWithoutExtension(path)+suffix+Path.GetExtension(path));
+        if (outputName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 ||
+            !string.Equals(
+                outputName,
+                Path.GetFileName(outputName),
+                StringComparison.Ordinal))
+        {
+            throw new InvalidDataException(
+                "The output name is invalid. Enter a file name without folders.");
+        }
+
+        if (string.IsNullOrEmpty(Path.GetExtension(outputName)))
+        {
+            outputName += ".exe";
+        }
+        else if (!string.Equals(
+                     Path.GetExtension(outputName),
+                     ".exe",
+                     StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException(
+                "The output file must use the .exe extension.");
+        }
+
+        if (string.Equals(
+                outputName,
+                Path.GetFileName(sourcePath),
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException(
+                "The output name cannot match the original executable.");
+        }
+
+        return outputName;
+    }
+
+    private sealed class ClientAlreadyPatchedException(string message)
+        : InvalidOperationException(message);
 }

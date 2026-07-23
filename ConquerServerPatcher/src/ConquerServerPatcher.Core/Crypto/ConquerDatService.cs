@@ -17,35 +17,70 @@ public sealed class ConquerDatService
         var modulus = BigIntegerCodec.FromBigEndianUnsigned(key.Modulus!);
         var encrypted = File.ReadAllBytes(encryptedPath);
         if (encrypted.Length == 0 || encrypted.Length % RsaBlockSize != 0)
-            throw new InvalidDataException("El archivo cifrado no contiene bloques RSA completos de 256 bytes.");
+        {
+            throw new InvalidDataException(
+                "The file does not contain complete 256-byte RSA blocks. " +
+                "This DAT file may use a different encryption method.");
+        }
 
         using var compressed = new MemoryStream();
         for (var offset = 0; offset < encrypted.Length; offset += RsaBlockSize)
         {
-            var c = BigIntegerCodec.FromBigEndianUnsigned(encrypted.AsSpan(offset, RsaBlockSize));
-            var padded = BigIntegerCodec.ToBigEndianUnsigned(BigInteger.ModPow(c, PublicExponent, modulus), RsaBlockSize);
-            ValidateType1Padding(padded, out var dataOffset);
+            var cipher = BigIntegerCodec.FromBigEndianUnsigned(
+                encrypted.AsSpan(offset, RsaBlockSize));
+            var padded = BigIntegerCodec.ToBigEndianUnsigned(
+                BigInteger.ModPow(cipher, PublicExponent, modulus),
+                RsaBlockSize);
+            var dataOffset = FindPayloadOffset(padded, offset / RsaBlockSize);
             compressed.Write(padded, dataOffset, padded.Length - dataOffset);
         }
 
-        compressed.Position = 0;
+        var payload = compressed.ToArray();
+        if (payload.Length < 2 || payload[0] != 0x1F || payload[1] != 0x8B)
+        {
+            throw new InvalidDataException(
+                "The RSA output does not contain GZip data. Make sure the selected " +
+                "original Conquer.exe belongs to this DAT file and that the file uses RSA encryption.");
+        }
+
+        using var compressedInput = new MemoryStream(payload);
+        using var gzip = new GZipStream(compressedInput, CompressionMode.Decompress);
+        using var plain = new MemoryStream();
+        try
+        {
+            gzip.CopyTo(plain);
+        }
+        catch (InvalidDataException ex)
+        {
+            throw new InvalidDataException(
+                "The RSA blocks were decrypted, but the GZip payload is damaged " +
+                "or uses a different format.",
+                ex);
+        }
+
         EnsureParent(outputPath);
-        using var gzip = new GZipStream(compressed, CompressionMode.Decompress);
-        using var output = File.Create(outputPath);
-        gzip.CopyTo(output);
+        File.WriteAllBytes(outputPath, plain.ToArray());
     }
 
     public void Encrypt(string plainPath, string privateKeyPath, string outputPath)
     {
         var key = _keys.LoadPrivate(privateKeyPath);
-        if (key.D is null || key.Modulus is null) throw new InvalidDataException("La clave PEM no contiene parámetros privados.");
-        var d = BigIntegerCodec.FromBigEndianUnsigned(key.D);
+        if (key.D is null || key.Modulus is null)
+            throw new InvalidDataException(
+                "The PEM key does not contain private parameters.");
+
+        var privateExponent = BigIntegerCodec.FromBigEndianUnsigned(key.D);
         var modulus = BigIntegerCodec.FromBigEndianUnsigned(key.Modulus);
         var plain = File.ReadAllBytes(plainPath);
 
         using var compressed = new MemoryStream();
-        using (var gzip = new GZipStream(compressed, CompressionLevel.Optimal, leaveOpen: true))
+        using (var gzip = new GZipStream(
+                   compressed,
+                   CompressionLevel.Optimal,
+                   leaveOpen: true))
+        {
             gzip.Write(plain);
+        }
 
         var payload = compressed.ToArray();
         EnsureParent(outputPath);
@@ -54,15 +89,19 @@ public sealed class ConquerDatService
         {
             var size = Math.Min(PlainChunkSize, payload.Length - offset);
             var padded = CreateType1PaddedBlock(payload.AsSpan(offset, size));
-            var m = BigIntegerCodec.FromBigEndianUnsigned(padded);
-            var cipher = BigIntegerCodec.ToBigEndianUnsigned(BigInteger.ModPow(m, d, modulus), RsaBlockSize);
+            var message = BigIntegerCodec.FromBigEndianUnsigned(padded);
+            var cipher = BigIntegerCodec.ToBigEndianUnsigned(
+                BigInteger.ModPow(message, privateExponent, modulus),
+                RsaBlockSize);
             output.Write(cipher);
         }
     }
 
     private static byte[] CreateType1PaddedBlock(ReadOnlySpan<byte> chunk)
     {
-        if (chunk.Length > PlainChunkSize) throw new ArgumentOutOfRangeException(nameof(chunk));
+        if (chunk.Length > PlainChunkSize)
+            throw new ArgumentOutOfRangeException(nameof(chunk));
+
         var result = new byte[RsaBlockSize];
         result[0] = 0;
         result[1] = 1;
@@ -73,20 +112,25 @@ public sealed class ConquerDatService
         return result;
     }
 
-    private static void ValidateType1Padding(byte[] block, out int dataOffset)
+    private static int FindPayloadOffset(byte[] block, int blockIndex)
     {
-        if (block.Length != RsaBlockSize || block[0] != 0 || block[1] != 1)
-            throw new InvalidDataException("Padding PKCS#1 tipo 1 inválido.");
         var separator = Array.IndexOf(block, (byte)0, 2);
-        if (separator < 10) throw new InvalidDataException("Bloque RSA con padding insuficiente.");
-        for (var i = 2; i < separator; i++)
-            if (block[i] != 0xFF) throw new InvalidDataException("Padding PKCS#1 corrupto.");
-        dataOffset = separator + 1;
+        if (separator < 0)
+        {
+            throw new InvalidDataException(
+                $"The end of the RSA padding was not found in block {blockIndex + 1}. " +
+                "The client key does not match this file.");
+        }
+
+        // Match the original script: discard bytes through the first 00 byte
+        // starting at position 2, without requiring canonical PKCS#1 padding.
+        return separator + 1;
     }
 
     private static void EnsureParent(string path)
     {
-        var dir = Path.GetDirectoryName(Path.GetFullPath(path));
-        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+        var directory = Path.GetDirectoryName(Path.GetFullPath(path));
+        if (!string.IsNullOrEmpty(directory))
+            Directory.CreateDirectory(directory);
     }
 }

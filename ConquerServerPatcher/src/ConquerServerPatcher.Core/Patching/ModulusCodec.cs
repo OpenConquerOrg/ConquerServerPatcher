@@ -9,7 +9,8 @@ public static class ModulusCodec
 
     public static uint[] ToWords(ReadOnlySpan<byte> modulus)
     {
-        if (modulus.Length != 256) throw new InvalidDataException("El módulo RSA debe tener 256 bytes.");
+        if (modulus.Length != 256)
+            throw new InvalidDataException("The RSA modulus must contain 256 bytes.");
         var words = new uint[WordCount];
         for (var i = 0; i < WordCount; i++)
             words[i] = BinaryPrimitives.ReadUInt32BigEndian(modulus.Slice(i * 4, 4));
@@ -18,7 +19,8 @@ public static class ModulusCodec
 
     public static byte[] FromWords(IReadOnlyList<uint> words)
     {
-        if (words.Count != WordCount) throw new InvalidDataException("Se esperaban 64 palabras RSA.");
+        if (words.Count != WordCount)
+            throw new InvalidDataException("Expected 64 RSA words.");
         var result = new byte[256];
         for (var i = 0; i < WordCount; i++)
             BinaryPrimitives.WriteUInt32BigEndian(result.AsSpan(i * 4, 4), words[i]);
@@ -27,7 +29,8 @@ public static class ModulusCodec
 
     public static uint[] Obfuscate(IReadOnlyList<uint> words)
     {
-        if (words.Count != WordCount) throw new InvalidDataException("Se esperaban 64 palabras RSA.");
+        if (words.Count != WordCount)
+            throw new InvalidDataException("Expected 64 RSA words.");
         var obfuscated = new uint[WordCount];
         obfuscated[63] = words[XorStartIndex - 1];
         for (var j = 62; j >= 0; j--)
@@ -37,7 +40,8 @@ public static class ModulusCodec
 
     public static uint[] Deobfuscate(IReadOnlyList<uint> obfuscated)
     {
-        if (obfuscated.Count != WordCount) throw new InvalidDataException("Se esperaban 64 palabras RSA ofuscadas.");
+        if (obfuscated.Count != WordCount)
+            throw new InvalidDataException("Expected 64 obfuscated RSA words.");
         var words = new uint[WordCount];
         var idx = XorStartIndex;
         for (var j = 0; j < 63; j++) words[idx++ % WordCount] = obfuscated[j] ^ obfuscated[j + 1];
