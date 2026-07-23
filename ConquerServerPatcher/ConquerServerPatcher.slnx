@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/ConquerServerPatcher.Core/ConquerServerPatcher.Core.csproj" />
+  <Project Path="src/ConquerServerPatcher.Wpf/ConquerServerPatcher.Wpf.csproj" />
+</Solution>

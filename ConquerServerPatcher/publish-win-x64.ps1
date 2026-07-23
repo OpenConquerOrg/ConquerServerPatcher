@@ -1,5 +1,5 @@
 $ErrorActionPreference = "Stop"
-dotnet publish "$PSScriptRoot/src/ConquerRsaTool.Wpf/ConquerRsaTool.Wpf.csproj" `
+dotnet publish "$PSScriptRoot/src/ConquerServerPatcher.Wpf/ConquerServerPatcher.Wpf.csproj" `
   -c Release `
   -r win-x64 `
   --self-contained true `

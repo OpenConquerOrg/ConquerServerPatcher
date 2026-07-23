@@ -1,4 +1,0 @@
-<Solution>
-  <Project Path="src/ConquerRsaTool.Core/ConquerRsaTool.Core.csproj" />
-  <Project Path="src/ConquerRsaTool.Wpf/ConquerRsaTool.Wpf.csproj" />
-</Solution>

@@ -1,4 +1,4 @@
-# Conquer RSA Tool — WPF / .NET 10
+# ConquerServerPatcher — WPF / .NET 10
 
 Primera versión completa en C# del flujo de `conquer-rsa-patcher`.
 
@@ -20,15 +20,15 @@ Primera versión completa en C# del flujo de `conquer-rsa-patcher`.
 
 ## Abrir y ejecutar
 
-1. Abre `ConquerRsaTool.slnx`.
-2. Establece `ConquerRsaTool.Wpf` como proyecto de inicio.
+1. Abre `ConquerServerPatcher.slnx`.
+2. Establece `ConquerServerPatcher.Wpf` como proyecto de inicio.
 3. Compila en `Release`.
 
 Por terminal:
 
 ```powershell
-dotnet build ConquerRsaTool.slnx -c Release
-dotnet run --project src/ConquerRsaTool.Wpf
+dotnet build ConquerServerPatcher.slnx -c Release
+dotnet run --project src/ConquerServerPatcher.Wpf
 ```
 
 ## Flujo recomendado
